@@ -1,0 +1,6 @@
+{
+  "name": "NÚCLEO CONTROL - Sistema Control de Gestión",
+  "description": "Consola de control operativo y asignación de órdenes con Telegram Bot, recordatorios automáticos a grupos, estadísticas por profesional y reportes en PDF y Excel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
