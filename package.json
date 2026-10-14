@@ -1,7 +1,9 @@
 {
-  "name": "react-example",
-  "private": true,
-  "version": "0.0.0",
+  "name": "cntrol-de-gestion",
+  "private": false,
+  "version": "1.0.0",
+  "description": "Sistema de control y gestión de tareas por áreas de responsabilidad con integración a Telegram y análisis de KPIs.",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
