@@ -16,6 +16,8 @@ export interface FlushResult {
   results: Array<{ id: string; applied: boolean; reason: string }>;
 }
 
+import { getToken } from '../lib/api';
+
 const STORAGE_KEY = 'nucleo_sync_queue_fifo';
 
 class SyncQueueService {
@@ -126,9 +128,13 @@ class SyncQueueService {
     console.log(`[SyncQueue FIFO] Iniciando subida de ${items.length} cambio(s) pendientes al servidor...`);
 
     try {
+      const token = getToken();
       const response = await fetch('/api/sync/fifo', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ items }),
       });
 

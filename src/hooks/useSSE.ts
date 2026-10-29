@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { getToken } from '../lib/api';
 
 export interface SSEHeartbeat {
   type: 'heartbeat';
@@ -19,6 +20,7 @@ export interface UseSSEOptions {
   onTelegramEvent?: (event: any) => void;
   onSyncBatchApplied?: (result: any) => void;
   onKpiAnalysis?: (kpi: any) => void;
+  onMembersUpdated?: (data: any) => void;
   onReconnectSuccess?: () => void;
 }
 
@@ -35,6 +37,7 @@ export function useSSE(options: UseSSEOptions = {}) {
     onTelegramEvent,
     onSyncBatchApplied,
     onKpiAnalysis,
+    onMembersUpdated,
     onReconnectSuccess,
   } = options;
 
@@ -59,6 +62,7 @@ export function useSSE(options: UseSSEOptions = {}) {
     onTelegramEvent,
     onSyncBatchApplied,
     onKpiAnalysis,
+    onMembersUpdated,
     onReconnectSuccess,
   });
 
@@ -72,6 +76,7 @@ export function useSSE(options: UseSSEOptions = {}) {
       onTelegramEvent,
       onSyncBatchApplied,
       onKpiAnalysis,
+      onMembersUpdated,
       onReconnectSuccess,
     };
   }, [
@@ -83,6 +88,7 @@ export function useSSE(options: UseSSEOptions = {}) {
     onTelegramEvent,
     onSyncBatchApplied,
     onKpiAnalysis,
+    onMembersUpdated,
     onReconnectSuccess,
   ]);
 
@@ -101,7 +107,9 @@ export function useSSE(options: UseSSEOptions = {}) {
 
     try {
       console.log(`[useSSE] Conectando a canal de eventos en tiempo real: ${url}...`);
-      const es = new EventSource(url);
+      const token = getToken();
+      const target = token ? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : url;
+      const es = new EventSource(target);
       eventSourceRef.current = es;
 
       es.onopen = () => {
@@ -188,6 +196,14 @@ export function useSSE(options: UseSSEOptions = {}) {
         try {
           const data = JSON.parse(event.data);
           callbacksRef.current.onKpiAnalysis?.(data);
+        } catch {}
+      });
+
+      // 9. Members synced from Telegram
+      es.addEventListener('members_updated', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          callbacksRef.current.onMembersUpdated?.(data);
         } catch {}
       });
 

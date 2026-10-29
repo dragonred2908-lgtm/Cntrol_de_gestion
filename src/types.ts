@@ -19,6 +19,7 @@ export interface Member {
   status: 'activo' | 'ausente' | 'inactivo';
   avatar?: string;
   color?: string;
+  lastSeenAt?: string;
 }
 
 export interface Order {

@@ -10,6 +10,7 @@ export type Permission =
   | 'view_activity_logs'
   | 'access_dev_tools'     // System console, webhook debug, simulation
   | 'configure_telegram'   // Bot tokens, group IDs
+  | 'sync_members'         // Barrido de integrantes del grupo de Telegram
   | 'reset_database'
   | 'web_access';          // Allowed to enter main web UI
 
@@ -37,6 +38,7 @@ export const RBAC_MATRIX: Record<UserRole, RolePermissions> = {
       'view_activity_logs',
       'access_dev_tools',
       'configure_telegram',
+      'sync_members',
       'reset_database',
     ],
     exclusiveFeatures: [
@@ -59,6 +61,7 @@ export const RBAC_MATRIX: Record<UserRole, RolePermissions> = {
       'view_professionals',
       'send_reminders',
       'view_activity_logs',
+      'sync_members',
     ],
     exclusiveFeatures: [
       'Asignación ejecutiva de órdenes con aviso push a Telegram',

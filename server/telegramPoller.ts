@@ -2,6 +2,7 @@ import { state, telegramController } from './init.js';
 
 let pollerRunning = false;
 let lastUpdateId = 0;
+let lastError = '';
 
 export async function startTelegramPoller() {
   if (pollerRunning) return;
@@ -21,10 +22,17 @@ export async function startTelegramPoller() {
         const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${lastUpdateId + 1}&timeout=15`;
         const resp = await fetch(url);
         if (!resp.ok) {
+          const data = (await resp.json().catch(() => null)) as any;
+          const description = data?.description || `HTTP ${resp.status}`;
+          if (description !== lastError) {
+            console.warn(`[Telegram] getUpdates rechazado: ${description}`);
+            lastError = description;
+          }
           await new Promise((r) => setTimeout(r, 6000));
           continue;
         }
 
+        lastError = '';
         const data = (await resp.json()) as any;
         if (data.ok && Array.isArray(data.result)) {
           for (const update of data.result) {

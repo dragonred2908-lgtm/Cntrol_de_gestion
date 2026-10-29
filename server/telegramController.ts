@@ -74,46 +74,47 @@ export async function sendTelegramMessage(
  * Construye la carga formateada en HTML y los botones táctiles inline
  */
 export function buildOrderTelegramPayload(order: Order) {
-  const priorityEmoji: Record<string, string> = {
-    baja: '🟢 Baja',
-    media: '🟡 Media',
-    alta: '🟠 Alta',
-    urgente: '🔴 Urgente',
-  };
+  const assignedName = order.assignedTo?.name || 'Sin asignar';
+  const assignedHandle = order.assignedTo?.telegramUser ? ` · ${order.assignedTo.telegramUser}` : '';
 
-  const statusLabels: Record<string, string> = {
-    recibida: '📥 Recibida',
-    en_cuenta: '👀 En Cuenta',
-    en_proceso: '⏳ En Proceso',
-    finalizada: '✅ Finalizada',
-  };
+  const start = new Date(order.createdAt);
+  const due = new Date(order.dueDate);
 
-  const dueFormatted = new Date(order.dueDate).toLocaleString('es-ES', {
-    dateStyle: 'short',
-    timeStyle: 'short',
-  });
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const shortDate = (date: Date) =>
+    `${pad(date.getDate())}/${pad(date.getMonth() + 1)} · ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 
-  const assignedHandle = order.assignedTo
-    ? `${order.assignedTo.name} (${order.assignedTo.telegramUser})`
-    : 'Sin asignar';
+  const startLabel = shortDate(start);
+  const dueLabel = shortDate(due);
+
+  // Plazo: en horas cuando el superior asignó 48 h o menos; en días cuando el plazo es mayor.
+  const windowHours = Math.max(0, (due.getTime() - start.getTime()) / 3_600_000);
+  const useHours = windowHours <= 48;
+
+  const remainingMs = due.getTime() - Date.now();
+  const remainingHours = Math.abs(remainingMs) / 3_600_000;
+  const hours = Math.max(1, Math.ceil(remainingHours));
+  const days = Math.max(1, Math.ceil(remainingHours / 24));
+  const amount = useHours ? `${hours} h` : days === 1 ? '1 día' : `${days} días`;
+
+  const countdown =
+    remainingMs < 0
+      ? `⚠️ <b>Vencida</b> hace ${amount}`
+      : `⏳ <b>Quedan ${amount}</b> para cumplir la orden`;
 
   const text =
-    `📋 <b>ORDEN DE GESTIÓN: #${order.id}</b>\n\n` +
-    `<b>Título:</b> ${order.title}\n` +
-    `<b>Prioridad:</b> ${priorityEmoji[order.priority] || order.priority}\n` +
-    `<b>Estado Actual:</b> ${statusLabels[order.status] || order.status}\n` +
-    `<b>Asignada a:</b> ${assignedHandle}\n` +
-    `<b>Fecha Límite:</b> ⏰ ${dueFormatted}\n` +
-    (order.department ? `<b>Área/Dpto:</b> ${order.department}\n` : '') +
-    `\n<b>Descripción:</b>\n<i>${order.description}</i>\n\n` +
-    `👇 <i>Selecciona una opción para actualizar el estado en tiempo real:</i>`;
+    `👤 <b>${assignedName}</b>${assignedHandle}\n\n` +
+    `📌 <b>${order.title}</b>\n` +
+    `${order.description}\n\n` +
+    `<pre>INICIO         VENCE\n${startLabel}  ${dueLabel}</pre>\n` +
+    `${countdown}\n\n` +
+    `👇 <i>Actualizá el estado de la orden:</i>`;
 
   const inlineKeyboard = {
     inline_keyboard: [
       [
-        { text: '📥 En Cuenta', callback_data: `status:${order.id}:en_cuenta` },
-        { text: '⏳ En Proceso', callback_data: `status:${order.id}:en_proceso` },
-        { text: '✅ Finalizada', callback_data: `status:${order.id}:finalizada` },
+        { text: '👀 En cuenta', callback_data: `status:${order.id}:en_cuenta` },
+        { text: '✅ Orden finalizada', callback_data: `status:${order.id}:finalizada` },
       ],
     ],
   };
@@ -128,6 +129,7 @@ export class TelegramController {
   private db: DatabaseState;
   private io?: SocketIOServer;
   private saveDb: (db: DatabaseState) => void;
+  private memberSyncTimer?: ReturnType<typeof setInterval>;
 
   constructor(db: DatabaseState, saveDb: (db: DatabaseState) => void, io?: SocketIOServer) {
     this.db = db;
@@ -158,11 +160,237 @@ export class TelegramController {
   }
 
   /**
+   * Verifica si quien escribe es administrador del grupo o está en TELEGRAM_ADMIN_IDS.
+   */
+  private async isPrivilegedSender(
+    token: string,
+    chatId: string | number,
+    userId?: number,
+    username?: string
+  ): Promise<boolean> {
+    const allowed = (process.env.TELEGRAM_ADMIN_IDS || '')
+      .split(',')
+      .map((value) => value.trim().replace(/^@/, '').toLowerCase())
+      .filter(Boolean);
+
+    if (username && allowed.includes(username.toLowerCase())) return true;
+    if (userId && allowed.includes(String(userId))) return true;
+
+    if (!token || !chatId || !userId) return false;
+
+    try {
+      const response = await fetch(
+        `https://api.telegram.org/bot${token}/getChatMember?chat_id=${chatId}&user_id=${userId}`
+      );
+      const data = (await response.json()) as any;
+      const status = data?.result?.status;
+      return status === 'creator' || status === 'administrator';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Crea o actualiza un integrante a partir de un usuario de Telegram.
+   */
+  private upsertTelegramMember(
+    user: any,
+    extra: { role?: string; seenAt?: string } = {}
+  ): { status: 'created' | 'updated' | 'unchanged'; name: string } {
+    const palette = ['#3B82F6', '#8B5CF6', '#10B981', '#F59E0B', '#EC4899', '#6366F1'];
+    const username = user.username ? `@${user.username}` : '';
+    const fullName = [user.first_name, user.last_name].filter(Boolean).join(' ').trim();
+    const fallbackName = username || `Integrante ${user.id}`;
+    const seenAt = extra.seenAt;
+
+    const existing = this.db.members.find(
+      (member) =>
+        (username && member.telegramUser.toLowerCase() === username.toLowerCase()) ||
+        (member.telegramChatId && String(member.telegramChatId) === String(user.id)) ||
+        (fullName && member.name.toLowerCase() === fullName.toLowerCase())
+    );
+
+    if (existing) {
+      const nextName = fullName || existing.name;
+      const nextUser = username || existing.telegramUser;
+      const lastSeenStale =
+        Boolean(seenAt) &&
+        (!existing.lastSeenAt || Date.now() - new Date(existing.lastSeenAt).getTime() > 3_600_000);
+
+      const changed =
+        existing.name !== nextName ||
+        existing.telegramUser !== nextUser ||
+        String(existing.telegramChatId ?? '') !== String(user.id) ||
+        lastSeenStale;
+
+      existing.name = nextName;
+      existing.telegramUser = nextUser;
+      existing.telegramChatId = user.id;
+      if (seenAt) existing.lastSeenAt = seenAt;
+
+      return { status: changed ? 'updated' : 'unchanged', name: nextName };
+    }
+
+    this.db.members.push({
+      id: `mem-tg-${user.id}`,
+      name: fullName || fallbackName,
+      telegramUser: username || `tg:${user.id}`,
+      telegramChatId: user.id,
+      role: extra.role || 'Integrante del grupo',
+      email: '',
+      status: 'activo',
+      color: palette[this.db.members.length % palette.length],
+      ...(seenAt ? { lastSeenAt: seenAt } : {}),
+    });
+
+    return { status: 'created', name: fullName || fallbackName };
+  }
+
+  /**
+   * Registra la interacción de un integrante en el grupo (alta o refresco).
+   */
+  private trackGroupParticipant(from: any, chatType?: string): boolean {
+    if (!from || from.is_bot) return false;
+    if (chatType !== 'group' && chatType !== 'supergroup') return false;
+
+    const result = this.upsertTelegramMember(from, {
+      role: 'Integrante del grupo',
+      seenAt: new Date().toISOString(),
+    });
+    if (result.status === 'unchanged') return false;
+
+    this.saveDb(this.db);
+    if (this.io) this.io.emit('mirror:members_updated', { members: this.db.members });
+    sseManager.broadcast('members_updated', { members: this.db.members });
+    return true;
+  }
+
+  /**
+   * Barrido del grupo: sincroniza los integrantes que la Bot API permite leer
+   * (administradores y creador) con la lista de integrantes del sistema.
+   */
+  public async syncGroupMembers(chatId: string | number, requestedBy: string) {
+    const token = this.db.telegramConfig.botToken || process.env.TELEGRAM_BOT_TOKEN || '';
+    if (!token) return { ok: false as const, reason: 'Sin token de bot configurado' };
+
+    const call = async (method: string) => {
+      const response = await fetch(
+        `https://api.telegram.org/bot${token}/${method}?chat_id=${chatId}`
+      );
+      return (await response.json()) as any;
+    };
+
+    const adminsResponse = await call('getChatAdministrators');
+    if (!adminsResponse?.ok) {
+      return {
+        ok: false as const,
+        reason: adminsResponse?.description || 'No se pudo leer la lista del grupo',
+      };
+    }
+
+    const countResponse = await call('getChatMemberCount');
+    const groupCount = countResponse?.ok ? Number(countResponse.result) : undefined;
+
+    let created = 0;
+    let updated = 0;
+    let unchanged = 0;
+    const createdNames: string[] = [];
+
+    for (const entry of adminsResponse.result as any[]) {
+      const user = entry?.user;
+      if (!user || user.is_bot) continue;
+
+      const result = this.upsertTelegramMember(user, {
+        role:
+          entry.custom_title ||
+          (entry.status === 'creator' ? 'Creador del grupo' : 'Administrador'),
+      });
+
+      if (result.status === 'created') {
+        created += 1;
+        createdNames.push(result.name);
+      } else if (result.status === 'updated') {
+        updated += 1;
+      } else {
+        unchanged += 1;
+      }
+    }
+
+    const log: ActivityLog = {
+      id: `act-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      actor: requestedBy,
+      action: 'Integrantes sincronizados desde Telegram',
+      details: `Barrido del grupo: ${created} nuevos, ${updated} actualizados, ${unchanged} sin cambios.`,
+      type: 'member',
+    };
+    this.db.activity.unshift(log);
+    this.saveDb(this.db);
+
+    if (this.io) {
+      this.io.emit('mirror:members_updated', { members: this.db.members });
+      this.io.emit('mirror:activity_logged', log);
+      this.io.emit('mirror:telegram_event', { type: 'members_synced' });
+    }
+    sseManager.broadcast('members_updated', { members: this.db.members });
+    sseManager.broadcast('activity_logged', log);
+
+    return {
+      ok: true as const,
+      created,
+      updated,
+      unchanged,
+      createdNames,
+      total: this.db.members.length,
+      groupCount,
+    };
+  }
+
+  /**
+   * Barrido automático diario: mantiene la lista al día sin intervención.
+   */
+  public startDailyMemberSync(intervalHours = 24) {
+    if (this.memberSyncTimer) return;
+
+    const run = async () => {
+      const token = this.db.telegramConfig.botToken || process.env.TELEGRAM_BOT_TOKEN || '';
+      const chatId = this.db.telegramConfig.groupChatId || process.env.TELEGRAM_GROUP_CHAT_ID || '';
+      if (!token || !chatId) return;
+
+      const summary = await this.syncGroupMembers(chatId, 'Barrido automático diario');
+      if (summary.ok) {
+        console.log(
+          `[Telegram] Barrido diario de integrantes: ${summary.created} nuevos, ${summary.updated} actualizados, ${summary.unchanged} sin cambios.`
+        );
+      } else {
+        console.warn(`[Telegram] Barrido diario omitido: ${summary.reason}`);
+      }
+    };
+
+    setTimeout(() => void run(), 60_000);
+    this.memberSyncTimer = setInterval(
+      () => void run(),
+      Math.max(1, intervalHours) * 3_600_000
+    );
+  }
+
+  /**
    * Procesa updates entrantes (Webhook o Poller en vivo)
    */
   public async handleUpdate(update: any) {
     if (!update) return { ok: false, error: 'Empty update' };
     const token = this.db.telegramConfig.botToken || process.env.TELEGRAM_BOT_TOKEN || '';
+
+    // 0. Registro pasivo de integrantes que interactúan en el grupo
+    if (update.message?.from) {
+      this.trackGroupParticipant(update.message.from, update.message.chat?.type);
+    }
+    if (update.callback_query?.from) {
+      this.trackGroupParticipant(
+        update.callback_query.from,
+        update.callback_query.message?.chat?.type
+      );
+    }
 
     // 1. Manejo de botones de acción rápida [En Cuenta], [En Proceso], [Finalizada]
     if (update.callback_query) {
@@ -276,8 +504,9 @@ export class TelegramController {
           `<b>Comandos de Operadores:</b>\n` +
           `• <code>/nuevaorden [Título] | [Descripción] | [baja/media/alta/urgente] | [@usuario]</code>\n` +
           `• <code>/ordenes</code> - Listar órdenes pendientes asignadas\n` +
+          `• <code>/actualizar</code> - Sincronizar integrantes del grupo (solo admin/desarrollador)\n` +
           `• <code>/ayuda</code> - Ver instrucciones\n\n` +
-          `👇 <i>Todas las órdenes cuentan con botones directos [En Cuenta], [En Proceso] y [Finalizada].</i>`;
+          `👇 <i>Todas las órdenes cuentan con botones directos [En cuenta] y [Orden finalizada].</i>`;
 
         await sendTelegramMessage(token, chatId, helpText);
         return { ok: true, command: 'help' };
@@ -305,6 +534,53 @@ export class TelegramController {
           await sendTelegramMessage(token, chatId, msgList);
         }
         return { ok: true, command: 'ordenes' };
+      }
+
+      if (text === '/actualizar' || text.startsWith('/actualizar ')) {
+        const chatType = msg.chat.type;
+        if (chatType !== 'group' && chatType !== 'supergroup') {
+          await sendTelegramMessage(
+            token,
+            chatId,
+            '⚠️ <b>/actualizar</b> solo funciona dentro del grupo de trabajo.'
+          );
+          return { ok: false, command: 'actualizar', error: 'not_a_group' };
+        }
+
+        const allowed = await this.isPrivilegedSender(token, chatId, msg.from?.id, msg.from?.username);
+        if (!allowed) {
+          await sendTelegramMessage(
+            token,
+            chatId,
+            `⛔ <b>Acción restringida</b>\nSolo administradores y desarrolladores pueden ejecutar /actualizar.`
+          );
+          return { ok: false, command: 'actualizar', error: 'unauthorized' };
+        }
+
+        const summary = await this.syncGroupMembers(chatId, fromUser);
+        if (!summary.ok) {
+          await sendTelegramMessage(
+            token,
+            chatId,
+            `⚠️ No se pudo actualizar la lista de integrantes: ${summary.reason}`
+          );
+          return { ok: false, command: 'actualizar', error: summary.reason };
+        }
+
+        const reply =
+          `🔄 <b>INTEGRANTES ACTUALIZADOS</b>\n\n` +
+          `• Nuevos: <b>${summary.created}</b>\n` +
+          `• Actualizados: <b>${summary.updated}</b>\n` +
+          `• Sin cambios: <b>${summary.unchanged}</b>\n` +
+          `• Total en el sistema: <b>${summary.total}</b>\n` +
+          (summary.groupCount ? `• Miembros en el grupo: <b>${summary.groupCount}</b>\n` : '') +
+          (summary.createdNames.length
+            ? `\n<b>Se sumaron:</b>\n${summary.createdNames.map((name) => `• ${name}`).join('\n')}\n`
+            : '') +
+          `\n✅ La lista ya quedó actualizada en la consola web.`;
+
+        await sendTelegramMessage(token, chatId, reply);
+        return { ok: true, command: 'actualizar', summary };
       }
 
       if (text.startsWith('/nuevaorden') || text.toLowerCase().startsWith('orden:')) {

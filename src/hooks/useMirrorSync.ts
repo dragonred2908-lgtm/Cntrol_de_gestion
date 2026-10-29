@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { Order, ActivityLog, UserSession, MirrorSyncState, MirrorDevice } from '../types';
+import { getToken } from '../lib/api';
 
 interface UseMirrorSyncProps {
   session: UserSession;
@@ -57,10 +58,12 @@ export function useMirrorSync({
       : 'desktop';
 
     // Connect to same origin
+    const token = getToken();
     const socket = io({
       transports: ['websocket', 'polling'],
       reconnectionAttempts: 10,
       reconnectionDelay: 1500,
+      auth: { token },
       query: {
         role: session.role,
         name: session.name,

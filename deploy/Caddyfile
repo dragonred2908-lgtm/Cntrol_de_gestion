@@ -1,0 +1,11 @@
+# Reemplazá panel.tudominio.com por tu dominio o subdominio gratuito.
+# Caddy gestiona el certificado HTTPS (Let's Encrypt) automáticamente.
+
+panel.tudominio.com {
+	encode zstd gzip
+
+	# flush_interval -1 evita el buffering del stream SSE
+	reverse_proxy 127.0.0.1:3000 {
+		flush_interval -1
+	}
+}

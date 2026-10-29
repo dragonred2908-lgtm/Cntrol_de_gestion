@@ -60,6 +60,7 @@ export const TelegramView: React.FC<TelegramViewProps> = ({
     botFirstName?: string;
     groupDelivered?: boolean;
     latencyMs?: number;
+    botValid?: boolean;
   } | null>(null);
 
   const webhookUrl = `${window.location.origin}/api/telegram/webhook`;

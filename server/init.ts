@@ -83,7 +83,7 @@ const initialDatabase: DatabaseSchema = {
   members: INITIAL_MEMBERS,
   activity: INITIAL_ACTIVITY,
   telegramConfig: {
-    botToken: config.telegramBotToken || '***REMOVED***',
+    botToken: config.telegramBotToken || '',
     groupChatId: config.telegramGroupChatId || '-1002692322280',
     autoRemindersEnabled: true,
     autoReminderHoursBeforeDue: 12,

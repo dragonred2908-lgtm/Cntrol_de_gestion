@@ -1,4 +1,7 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
+import helmet from 'helmet';
+import compression from 'compression';
+import rateLimit from 'express-rate-limit';
 import { Server as SocketIOServer } from 'socket.io';
 import {
   state,
@@ -15,30 +18,169 @@ import {
   sendTelegramMessage,
 } from './telegramController.js';
 import { config } from './config.js';
+import { createSessionToken, isValidPin, requireAuth, ROLES, SESSION_TTL_SECONDS } from './auth.js';
 import { Order, Member, ActivityLog, OrderStatus, OrderPriority } from '../src/types.js';
 
 export function createApp(io?: SocketIOServer) {
   const app = express();
 
+  // Confianza en el proxy (Caddy/Nginx) para IP real y rate limiting
+  app.set('trust proxy', 1);
+
+  // Cabeceras de seguridad. CSP desactivada: la SPA usa estilos inline de Tailwind.
+  app.use(
+    helmet({
+      contentSecurityPolicy: false,
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+
+  // CORS restringido a los orígenes configurados (APP_URL / CORS_ORIGINS)
+  const allowedOrigins = [config.appUrl, process.env.CORS_ORIGINS || '']
+    .join(',')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+
   app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
+    const origin = req.headers.origin?.replace(/\/$/, '');
+    if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
+      res.header('Access-Control-Allow-Origin', origin);
+      res.header('Vary', 'Origin');
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.header(
+        'Access-Control-Allow-Headers',
+        'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+      );
     }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
 
-  app.use(express.json());
+  // Compresión (excepto SSE, que debe transmitir sin buffering)
+  app.use(
+    compression({
+      filter: (req, res) => {
+        if (req.path === '/api/realtime/stream') return false;
+        return compression.filter(req, res);
+      },
+    })
+  );
 
-  // 1. Health
+  app.use(express.json({ limit: '1mb' }));
+
+  // Métricas básicas en memoria
+  const metrics = {
+    startedAt: Date.now(),
+    requests: 0,
+    measuredRequests: 0,
+    errors: 0,
+    slowRequests: 0,
+    totalMs: 0,
+    byStatus: {} as Record<string, number>,
+  };
+
+  // Log de peticiones + métricas
+  app.use((req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+    const isStream = req.path === '/api/realtime/stream';
+    metrics.requests += 1;
+
+    res.on('finish', () => {
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      metrics.byStatus[res.statusCode] = (metrics.byStatus[res.statusCode] || 0) + 1;
+      if (res.statusCode >= 500) metrics.errors += 1;
+      // Los streams SSE quedan abiertos: no distorsionan la latencia
+      if (!isStream) {
+        metrics.measuredRequests += 1;
+        metrics.totalMs += durationMs;
+        if (durationMs > 1000) metrics.slowRequests += 1;
+      }
+
+      if (req.path.startsWith('/api') && !isStream) {
+        const line = {
+          level: res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
+          method: req.method,
+          path: req.path,
+          status: res.statusCode,
+          ms: Math.round(durationMs),
+        };
+        if (config.env === 'production') {
+          console.log(JSON.stringify(line));
+        } else if (res.statusCode >= 400 || durationMs > 1000) {
+          console.warn(`[api] ${line.method} ${line.path} → ${line.status} (${line.ms} ms)`);
+        }
+      }
+    });
+
+    next();
+  });
+
+  // API: sin caché por defecto
+  app.use('/api', (_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+
+  // Rate limiting global para la API
+  const apiLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 300,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    skip: (req) => req.path.startsWith('/telegram/webhook'),
+    message: { error: 'Demasiadas solicitudes. Esperá un minuto e intentá de nuevo.' },
+  });
+  app.use('/api', apiLimiter);
+
+  // Rate limiting estricto para autenticación
+  const authLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 10,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'Demasiados intentos de acceso. Esperá un minuto.' },
+  });
+  app.use('/api/auth', authLimiter);
+
+  // Autenticación obligatoria en toda la API salvo endpoints públicos.
+  // El webhook de Telegram se autentica con el secreto de la URL.
+  const PUBLIC_API_PATHS = ['/health', '/metrics', '/auth/verify', '/telegram/webhook'];
+  app.use('/api', (req, res, next) => {
+    if (PUBLIC_API_PATHS.some((path) => req.path.startsWith(path))) return next();
+    return requireAuth()(req, res, next);
+  });
+
+  // 1. Health & metrics
   app.get('/api/health', (_req, res) => {
+    const memory = process.memoryUsage();
     res.json({
       status: 'ok',
+      version: process.env.APP_VERSION || '1.0.0',
+      env: config.env,
       ordersCount: state.db.orders.length,
+      membersCount: state.db.members.length,
       telegramStatus: state.db.telegramConfig.status,
-      uptime: process.uptime(),
+      uptimeSeconds: Math.round(process.uptime()),
+      memoryMb: Math.round(memory.rss / 1024 / 1024),
+      node: process.version,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/api/metrics', (_req, res) => {
+    const uptimeSeconds = Math.max(1, Math.round((Date.now() - metrics.startedAt) / 1000));
+    res.json({
+      uptimeSeconds,
+      requests: metrics.requests,
+      errors: metrics.errors,
+      slowRequests: metrics.slowRequests,
+      avgLatencyMs: metrics.measuredRequests
+        ? Math.round(metrics.totalMs / metrics.measuredRequests)
+        : 0,
+      requestsPerMinute: Math.round((metrics.requests / uptimeSeconds) * 60),
+      byStatus: metrics.byStatus,
+      sseClients: sseManager.getClientsCount?.(),
     });
   });
 
@@ -64,7 +206,7 @@ export function createApp(io?: SocketIOServer) {
   });
 
   // 4. Persistence status and FIFO sync
-  app.get('/api/persistence/status', (_req, res) => {
+  app.get('/api/persistence/status', requireAuth(ROLES.managers), (_req, res) => {
     res.json(dualPersistence.getStatus());
   });
 
@@ -84,20 +226,34 @@ export function createApp(io?: SocketIOServer) {
     return res.json({ success: true, ...result, persistenceStatus: dualPersistence.getStatus() });
   });
 
-  // 5. Auth verify
+  // 5. Auth verify → canjea el PIN por un token firmado con caducidad
   app.post('/api/auth/verify', (req, res) => {
-    const { pin, role } = req.body;
-    const adminPin = config.adminPin || '123456';
-    if (role === 'viewer') {
-      return res.json({ authenticated: true, role: 'viewer', name: 'Observador' });
+    const { pin, role } = req.body ?? {};
+    const requestedRole = ROLES.any.includes(role) ? (role as (typeof ROLES.any)[number]) : 'admin';
+
+    // Todos los roles requieren PIN: sin esto la API quedaría abierta en lectura.
+    if (!isValidPin(pin)) {
+      return res.status(401).json({
+        authenticated: false,
+        message: 'PIN de acceso inválido.',
+      });
     }
-    if (pin === adminPin || pin === '123456' || pin === '1234') {
-      const roleName = role === 'developer' ? 'Personal de Desarrollo' : 'Administrador de Gestión';
-      return res.json({ authenticated: true, role: role || 'admin', name: roleName });
-    }
-    return res.status(401).json({
-      authenticated: false,
-      message: 'PIN de acceso inválido. El PIN configurado es ' + adminPin,
+
+    const name =
+      requestedRole === 'developer'
+        ? 'Personal de Desarrollo'
+        : requestedRole === 'viewer'
+          ? 'Observador'
+          : requestedRole === 'operator'
+            ? 'Operador'
+            : 'Administrador de Gestión';
+
+    return res.json({
+      authenticated: true,
+      role: requestedRole,
+      name,
+      token: createSessionToken(name, requestedRole),
+      expiresIn: SESSION_TTL_SECONDS,
     });
   });
 
@@ -130,7 +286,7 @@ export function createApp(io?: SocketIOServer) {
     res.json(filtered);
   });
 
-  app.post('/api/orders', async (req, res) => {
+  app.post('/api/orders', requireAuth(ROLES.operators), async (req, res) => {
     const {
       title,
       description,
@@ -201,7 +357,7 @@ export function createApp(io?: SocketIOServer) {
     res.status(201).json(newOrder);
   });
 
-  app.patch('/api/orders/:id/status', async (req, res) => {
+  app.patch('/api/orders/:id/status', requireAuth(ROLES.operators), async (req, res) => {
     const { id } = req.params;
     const { status, noteText, noteAuthor = 'Panel de Control', notifyTelegram = true } = req.body;
 
@@ -269,7 +425,7 @@ export function createApp(io?: SocketIOServer) {
     res.json(order);
   });
 
-  app.post('/api/orders/:id/notes', (req, res) => {
+  app.post('/api/orders/:id/notes', requireAuth(ROLES.operators), (req, res) => {
     const { id } = req.params;
     const { text, author = 'Administrador' } = req.body;
     if (!text) return res.status(400).json({ error: 'El texto es requerido' });
@@ -310,7 +466,7 @@ export function createApp(io?: SocketIOServer) {
     res.status(201).json(newNote);
   });
 
-  app.delete('/api/orders/:id', (req, res) => {
+  app.delete('/api/orders/:id', requireAuth(ROLES.managers), (req, res) => {
     const { id } = req.params;
     const initialLen = state.db.orders.length;
     state.db.orders = state.db.orders.filter((o) => o.id !== id);
@@ -343,7 +499,7 @@ export function createApp(io?: SocketIOServer) {
   // 7. Members endpoints
   app.get('/api/members', (_req, res) => res.json(state.db.members));
 
-  app.post('/api/members', (req, res) => {
+  app.post('/api/members', requireAuth(ROLES.managers), (req, res) => {
     const { name, telegramUser, role, email, status = 'activo', telegramChatId } = req.body;
     if (!name || !telegramUser) return res.status(400).json({ error: 'Nombre y usuario de Telegram son requeridos' });
 
@@ -378,17 +534,40 @@ export function createApp(io?: SocketIOServer) {
   });
 
   // 9. Telegram endpoints
-  app.post('/api/telegram/send-reminder', (req, res) => telegramController.handleSendReminder(req, res));
-  app.post('/api/telegram/broadcast', (req, res) => telegramController.handleBroadcast(req, res));
+  app.post(
+    '/api/telegram/send-reminder',
+    requireAuth(ROLES.managers),
+    (req, res) => telegramController.handleSendReminder(req, res)
+  );
+  app.post(
+    '/api/telegram/broadcast',
+    requireAuth(ROLES.managers),
+    (req, res) => telegramController.handleBroadcast(req, res)
+  );
 
-  app.get('/api/telegram/config', (_req, res) => {
+  app.post('/api/telegram/sync-members', requireAuth(ROLES.managers), async (req, res) => {
+    const chatId =
+      state.db.telegramConfig.groupChatId || process.env.TELEGRAM_GROUP_CHAT_ID || '';
+    if (!chatId) {
+      return res.status(400).json({ error: 'Configurá el Chat ID del grupo antes de sincronizar.' });
+    }
+
+    const summary = await telegramController.syncGroupMembers(
+      chatId,
+      req.body?.actor || 'Panel web'
+    );
+    if (!summary.ok) return res.status(502).json({ error: summary.reason });
+    return res.json(summary);
+  });
+
+  app.get('/api/telegram/config', requireAuth(ROLES.managers), (_req, res) => {
     const safeToken = state.db.telegramConfig.botToken
       ? `${state.db.telegramConfig.botToken.substring(0, 6)}...${state.db.telegramConfig.botToken.slice(-4)}`
       : '';
     res.json({ ...state.db.telegramConfig, tokenMasked: safeToken, hasToken: Boolean(state.db.telegramConfig.botToken) });
   });
 
-  app.post('/api/telegram/config', async (req, res) => {
+  app.post('/api/telegram/config', requireAuth(ROLES.managers), async (req, res) => {
     const { botToken, groupChatId, autoRemindersEnabled, autoReminderHoursBeforeDue } = req.body;
     if (botToken !== undefined && botToken !== '') state.db.telegramConfig.botToken = botToken;
     if (groupChatId !== undefined) state.db.telegramConfig.groupChatId = groupChatId;
@@ -427,7 +606,7 @@ export function createApp(io?: SocketIOServer) {
     return res.json(result);
   });
 
-  app.post('/api/telegram/test-connection', async (req, res) => {
+  app.post('/api/telegram/test-connection', requireAuth(ROLES.managers), async (req, res) => {
     const token = (req.body?.botToken && String(req.body.botToken).trim()) || state.db.telegramConfig.botToken || '';
     const groupId = (req.body?.groupChatId && String(req.body.groupChatId).trim()) || state.db.telegramConfig.groupChatId || '';
     if (!token) return res.status(400).json({ ok: false, botValid: false, error: 'No hay token de Telegram configurado.' });
@@ -447,7 +626,23 @@ export function createApp(io?: SocketIOServer) {
       let groupResult: any = null;
       const nowIso = new Date().toISOString().replace('T', ' ').substring(0, 19);
       const latency = Date.now() - startTime;
+
+      const webhookInfo = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`)
+        .then((resp) => resp.json() as Promise<any>)
+        .catch(() => null);
+      const activeWebhook: string = webhookInfo?.ok ? webhookInfo.result?.url || '' : '';
+
+      let chatInfo: any = null;
       if (groupId) {
+        chatInfo = await fetch(
+          `https://api.telegram.org/bot${token}/getChat?chat_id=${encodeURIComponent(groupId)}`
+        )
+          .then((resp) => resp.json() as Promise<any>)
+          .catch(() => null);
+      }
+      const chatFound = Boolean(chatInfo?.ok);
+
+      if (groupId && chatFound) {
         const pingText = `💓 <b>[HEARTBEAT] Verificación de Conectividad Telegram API</b>\n\n` +
           `🤖 <b>Bot:</b> @${meData.result.username} (${meData.result.first_name || 'Bot'})\n` +
           `⏱ <b>Timestamp:</b> ${nowIso} UTC\n` +
@@ -459,6 +654,9 @@ export function createApp(io?: SocketIOServer) {
       }
 
       state.db.telegramConfig.lastSync = new Date().toISOString();
+      state.db.telegramConfig.errorMessage = groupId && !chatFound
+        ? chatInfo?.description || 'No se pudo leer el grupo configurado'
+        : undefined;
       saveDatabase(state.db);
 
       if (io) {
@@ -471,23 +669,33 @@ export function createApp(io?: SocketIOServer) {
         });
       }
 
+      const chatError = chatInfo?.description || 'El bot no está agregado al grupo o el Chat ID es incorrecto.';
+      const message = !groupId
+        ? `¡Bot autenticado exitosamente como @${meData.result.username}! Falta el Chat ID del grupo.`
+        : !chatFound
+          ? `Bot @${meData.result.username} autenticado, pero el grupo ${groupId} no responde: ${chatError}`
+          : groupResult?.success
+            ? `¡Conexión verificada con éxito! Heartbeat enviado al grupo ${chatInfo.result.title || groupId} (Latencia: ${latency}ms).`
+            : `El grupo ${chatInfo.result.title || groupId} existe, pero el mensaje no se pudo enviar: ${groupResult?.error || 'error desconocido'}.`;
+
       return res.json({
         ok: true,
         botValid: true,
         botUsername: `@${meData.result.username}`,
         botFirstName: meData.result.first_name,
         groupDelivered: Boolean(groupId && groupResult?.success),
+        chatFound,
+        chatTitle: chatFound ? chatInfo.result.title : undefined,
+        webhookUrl: activeWebhook || undefined,
         latencyMs: latency,
-        message: groupId
-          ? `¡Conexión verificada con éxito! Heartbeat enviado al grupo ${groupId} (Latencia: ${latency}ms).`
-          : `¡Bot autenticado exitosamente como @${meData.result.username}!`,
+        message,
       });
     } catch (err: any) {
       return res.status(500).json({ ok: false, error: err.message });
     }
   });
 
-  app.post('/api/telegram/set-webhook', async (req, res) => {
+  app.post('/api/telegram/set-webhook', requireAuth(ROLES.managers), async (req, res) => {
     const token = state.db.telegramConfig.botToken || '';
     const { url } = req.body;
     if (!token) return res.status(400).json({ error: 'Token no configurado' });
@@ -504,7 +712,7 @@ export function createApp(io?: SocketIOServer) {
   });
 
   // 10. Reset data
-  app.post('/api/reset-data', (_req, res) => {
+  app.post('/api/reset-data', requireAuth(ROLES.managers), (_req, res) => {
     state.db = {
       orders: [],
       members: INITIAL_MEMBERS || [],
@@ -519,6 +727,21 @@ export function createApp(io?: SocketIOServer) {
     };
     saveDatabase(state.db);
     res.json({ success: true, message: 'Datos restaurados con éxito' });
+  });
+
+  // 404 para endpoints de API desconocidos
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Endpoint no encontrado' });
+  });
+
+  // Manejo centralizado de errores
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = Number(err?.status || err?.statusCode || 500);
+    if (status >= 500) console.error('[api] Error no controlado:', err?.message || err);
+    if (res.headersSent) return;
+    res.status(status).json({
+      error: status >= 500 ? 'Error interno del servidor' : err?.message || 'Solicitud inválida',
+    });
   });
 
   return app;

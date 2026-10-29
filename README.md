@@ -1,98 +1,148 @@
-# NÚCLEO CONTROL • Sistema de Control y Gestión de Tareas
+# NÚCLEO CONTROL — Centro de Operaciones
 
-Plataforma de misión crítica para el control, despacho y seguimiento en tiempo real de órdenes de trabajo por áreas de responsabilidad con integración bidireccional a Telegram Bot API y sincronización espejo multi-dispositivo.
+Sistema de control, despacho y seguimiento en tiempo real de órdenes de trabajo por áreas de responsabilidad, con integración bidireccional a Telegram y sincronización multi-dispositivo.
 
----
-
-## ⚡ Características Principales
-
-- **Gestión de Órdenes:** Ciclo de vida completo (`Recibida` ➔ `En Cuenta` ➔ `En Proceso` ➔ `Finalizada`) con prioridades, temporizadores regresivos y notas técnicas.
-- **Sincronización Espejo (Mirror Sync):** Comunicación en tiempo real con WebSockets (`Socket.IO`) y Server-Sent Events (`SSE`) con reconexión automática.
-- **Integración con Telegram:** Bot interactivo con inline buttons (`En Cuenta`, `En Proceso`, `Finalizada`), notificaciones push y comandos (`/nuevaorden`, `/ordenes`, `/estado`, `/ayuda`).
-- **Arquitectura Modular de Backend:** Servidor Express desacoplado en módulos especializados (`config`, `init`, `app`, `socket`, `socketHandlers`, `telegramPoller`).
-- **Persistencia Dual Resiliente:** Soporte primario y respaldo local JSON con cola FIFO contra desconexiones offline.
-- **Análisis de KPIs con IA:** Diagnóstico predictivo asistido por modelos de Google Gemini.
-- **Exportación Corporativa:** Descarga de reportes ejecutivos estructurados en Excel (.xlsx) y PDF profesional con tablas.
+> **v3.0 — Rediseño integral de la interfaz.** La app pasó de una pantalla única con ventanas en cascada a un **centro de operaciones con navegación por páginas**: bandeja "Hoy", tablero kanban, detalle de orden, equipo, Telegram, reportes, auditoría y ajustes. El backend Express y la integración con Telegram se mantienen.
 
 ---
 
-## 📁 Estructura del Proyecto
+## ⚡ Qué hace
+
+- **Ciclo de vida de órdenes:** `Recibida → En cuenta → En proceso → Finalizada`, con prioridades, vencimientos, notas y recordatorios.
+- **Tablero operativo:** kanban por estado con drag & drop, vista lista, filtros por prioridad, responsable y vencidas.
+- **Bandeja "Hoy":** prioriza lo urgente y vencido, muestra carga del equipo y actividad reciente.
+- **Detalle de orden:** stepper de estado, ficha completa, notas con autor y fecha, historial auditable.
+- **Telegram:** despacho automático al responsable o grupo, botones inline, recordatorios masivos e individuales, comunicados.
+- **Tiempo real:** WebSockets (Socket.IO) + Server-Sent Events con reconexión, presencia multi-dispositivo y cola FIFO offline.
+- **Reportes:** exportación Excel/PDF y diagnóstico de KPIs asistido por Gemini.
+- **RBAC:** permisos efectivos por rol en la interfaz y validación de PIN en el servidor.
+
+---
+
+## 📁 Estructura
 
 ```text
-├── server/
-│   ├── app.ts               # Aplicación Express y rutas REST (/api/*)
-│   ├── config.ts            # Configuración de entorno y validación de variables
-│   ├── dualPersistence.ts   # Manejador de persistencia dual y cola FIFO
-│   ├── init.ts              # Inicialización de estado y base de datos
-│   ├── kpiAiService.ts       # Integración con Gemini para análisis de KPIs
-│   ├── socket.ts            # Fábrica de Socket.io y servidor HTTP
-│   ├── socketHandlers.ts    # Manejadores de eventos de sockets y presencia
-│   ├── sseManager.ts        # Canal de Server-Sent Events con heartbeat
-│   ├── telegramController.ts# Lógica de bots, callbacks y webhooks de Telegram
-│   └── telegramPoller.ts    # Poller en segundo plano para Telegram Bot API
-├── server.ts                # Bootstrap principal y orquestador del servidor
 ├── src/
-│   ├── components/          # Componentes de React (UI Mission Control Dark)
-│   ├── hooks/               # Custom hooks (useMirrorSync, useSSE, useDualPersistence)
-│   ├── lib/                 # Utilidades de exportación y RBAC
-│   ├── services/            # Cola de sincronización FIFO del cliente
-│   ├── App.tsx              # Componente raíz
-│   └── main.tsx             # Punto de entrada de React
-├── data/
-│   └── database.json        # Base de datos local persistente
-├── package.json             # Dependencias y scripts de ejecución
-├── CONTRIBUTING.md          # Guía para contribuyentes
-└── LICENSE                  # Licencia Apache 2.0
+│   ├── app/
+│   │   ├── AppShell.tsx      # Sidebar, topbar, buscador global, toasts
+│   │   ├── router.tsx        # Router por hash (#/hoy, #/ordenes…)
+│   │   └── workspace.tsx     # Estado global, realtime y acciones
+│   ├── pages/
+│   │   ├── TodayPage.tsx
+│   │   ├── OrdersPage.tsx
+│   │   ├── OrderDetailPage.tsx
+│   │   ├── TeamPage.tsx
+│   │   ├── TelegramPage.tsx
+│   │   ├── ReportsPage.tsx
+│   │   ├── AuditPage.tsx
+│   │   └── SettingsPage.tsx
+│   ├── ui/kit.tsx            # Sistema de componentes (botones, cards, modales…)
+│   ├── features/             # Cards de orden, stepper, modales de alta/recordatorio
+│   ├── lib/                  # API tipada, helpers, RBAC, exportadores
+│   ├── hooks/                # useSSE, useMirrorSync, useDualPersistence
+│   ├── services/syncQueue.ts # Cola FIFO offline
+│   ├── index.css             # Design tokens + estilos base
+│   └── App.tsx               # Composición de la app
+├── server/
+│   ├── app.ts                # API REST (/api/*)
+│   ├── init.ts               # Estado y persistencia
+│   ├── dualPersistence.ts    # Persistencia local + resolución de conflictos
+│   ├── telegramController.ts # Bot, callbacks y webhooks
+│   ├── telegramPoller.ts     # Polling en segundo plano
+│   ├── sseManager.ts         # Canal SSE con heartbeat
+│   └── socketHandlers.ts     # Eventos Socket.IO
+├── server.ts                 # Bootstrap (Express + Vite + Socket.IO)
+└── data/database.json        # Base local persistente
 ```
 
 ---
 
-## 🚀 Instalación y Puesta en Marcha
+## 🚀 Puesta en marcha
 
-### 1. Prerrequisitos
-- **Node.js** >= 18.0.0
-- **npm** >= 9.0.0
+**Requisitos:** Node.js ≥ 18, npm ≥ 9.
 
-### 2. Configurar Variables de Entorno
-Copia el archivo de ejemplo y completa los valores requeridos:
 ```bash
-cp .env.example .env
+npm install
+cp .env.example .env    # completar variables
+npm run dev             # http://localhost:3000
 ```
 
-Variables disponibles:
+Variables de entorno:
+
 ```env
-GEMINI_API_KEY="tu_api_key_de_gemini"
+GEMINI_API_KEY="..."
 APP_URL="http://localhost:3000"
-TELEGRAM_BOT_TOKEN="tu_token_de_botfather"
-TELEGRAM_GROUP_CHAT_ID="-1001234567890"
+TELEGRAM_BOT_TOKEN="..."
+TELEGRAM_GROUP_CHAT_ID="-100..."
 ADMIN_PIN="123456"
 ```
 
-### 3. Instalar Dependencias
-```bash
-npm install
-```
+Producción:
 
-### 4. Modo Desarrollo
-Inicia el servidor modular con recarga rápida de Vite:
-```bash
-npm run dev
-```
-Accede a la interfaz en `http://localhost:3000`.
-
-### 5. Compilación y Producción
 ```bash
 npm run build
 npm start
 ```
 
+Verificación de tipos:
+
+```bash
+npm run lint
+```
+
 ---
 
-## 🛡️ Control de Acceso y Seguridad
-- **PIN Administrador:** `123456` (o `1234`)
-- **Roles:** `Administrador`, `Desarrollo`, `Operador de Campo`, `Observador (Viewer)`.
+## 🧭 Rutas de la interfaz
+
+| Ruta | Pantalla |
+| --- | --- |
+| `#/hoy` | Bandeja operativa y KPIs |
+| `#/ordenes` | Tablero kanban / lista |
+| `#/ordenes/:id` | Detalle de orden |
+| `#/equipo` | Integrantes y carga de trabajo |
+| `#/telegram` | Bot, grupo, recordatorios y comunicados |
+| `#/reportes` | Exportación y análisis IA |
+| `#/auditoria` | Historial de eventos |
+| `#/ajustes` | Sesión, infraestructura y datos |
+
+---
+
+## 🔌 API principal
+
+| Método | Endpoint | Uso |
+| --- | --- | --- |
+| `GET` | `/api/orders` | Listado de órdenes |
+| `POST` | `/api/orders` | Crear orden y despachar por Telegram |
+| `PATCH` | `/api/orders/:id/status` | Cambiar estado |
+| `POST` | `/api/orders/:id/notes` | Agregar nota |
+| `DELETE` | `/api/orders/:id` | Eliminar orden |
+| `GET/POST` | `/api/members` | Equipo |
+| `GET` | `/api/activity` | Auditoría |
+| `GET/POST` | `/api/telegram/config` | Configuración del bot |
+| `POST` | `/api/telegram/test-connection` | Probar token y grupo |
+| `POST` | `/api/telegram/send-reminder` | Recordatorio individual o masivo |
+| `POST` | `/api/telegram/broadcast` | Comunicado al grupo |
+| `POST` | `/api/ai/analyze-kpi` | Diagnóstico con Gemini |
+| `GET` | `/api/realtime/stream` | SSE en tiempo real |
+| `POST` | `/api/sync/fifo` | Sincronización offline |
+
+> La UI consume `PATCH /api/orders/:id/status` y `POST /api/orders/:id/notes`, que son los endpoints reales del backend. La versión anterior llamaba a rutas inexistentes y los cambios fallaban en silencio.
+
+---
+
+## 🛡️ Roles
+
+| Rol | Acceso web | Órdenes | Telegram | Reportes | Reset |
+| --- | --- | --- | --- | --- | --- |
+| Administrador | ✅ | ✅ | ✅ | ✅ | — |
+| Desarrollo | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Observador | ✅ | Solo lectura | — | Solo lectura | — |
+| Operador | ❌ (solo Telegram) | Botones inline | — | — | — |
+
+El PIN se valida en `/api/auth/verify`. La sesión se conserva en `localStorage`.
 
 ---
 
 ## 📄 Licencia
-Distribuido bajo la Licencia **Apache 2.0**. Consulta el archivo `LICENSE` para más información.
+
+Apache 2.0 — ver `LICENSE`.

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { syncQueue, SyncQueueItem, FlushResult } from '../services/syncQueue';
+import { getToken } from '../lib/api';
 
 export interface DualPersistenceStatus {
   primary: 'firestore';
@@ -35,7 +36,10 @@ export function useDualPersistence(options: UseDualPersistenceOptions = {}) {
   // Fetch persistence status from server
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/persistence/status');
+      const token = getToken();
+      const res = await fetch('/api/persistence/status', {
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      });
       if (res.ok) {
         const data = await res.json();
         setServerStatus(data);

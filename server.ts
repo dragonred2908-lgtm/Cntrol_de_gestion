@@ -7,7 +7,7 @@ import { createSocketServer } from './server/socket.js';
 import { config } from './server/config.js';
 import { telegramController, connectedDevices } from './server/init.js';
 import { registerSocketHandlers } from './server/socketHandlers.js';
-import { startTelegramPoller } from './server/telegramPoller.js';
+import { startTelegramPoller, stopTelegramPoller } from './server/telegramPoller.js';
 
 async function bootstrap() {
   const httpServer = http.createServer();
@@ -34,8 +34,22 @@ async function bootstrap() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    // Assets con hash: caché inmutable de 1 año
+    app.use(
+      '/assets',
+      express.static(path.join(distPath, 'assets'), { immutable: true, maxAge: '1y' })
+    );
+    // Resto de archivos estáticos; el HTML siempre se revalida
+    app.use(
+      express.static(distPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -44,7 +58,19 @@ async function bootstrap() {
     console.log(`Control de Gestión Server & Socket.io running at http://0.0.0.0:${config.port}`);
     // Start background Telegram poller
     startTelegramPoller();
+    // Barrido automático diario de integrantes del grupo
+    telegramController.startDailyMemberSync(24);
   });
+
+  // Cierre ordenado (Docker/systemd)
+  const shutdown = (signal: string) => {
+    console.log(`[server] ${signal} recibido. Cerrando servidor...`);
+    stopTelegramPoller();
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 10_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 bootstrap().catch((err) => {

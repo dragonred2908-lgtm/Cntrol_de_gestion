@@ -1,0 +1,21 @@
+[Unit]
+Description=NÚCLEO CONTROL — Centro de Operaciones
+After=network.target
+
+[Service]
+Type=simple
+User=nucleo
+Group=nucleo
+WorkingDirectory=/opt/nucleo
+EnvironmentFile=/opt/nucleo/.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/nucleo/dist/server.cjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nucleo/data
+
+[Install]
+WantedBy=multi-user.target
